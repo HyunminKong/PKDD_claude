@@ -1,4 +1,3 @@
-from .model import GPCDX_RCA
+from .model import DyCauseNet
 
-__all__ = ["GPCDX_RCA"]
-
+__all__ = ["DyCauseNet"]
