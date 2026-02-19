@@ -1,142 +1,119 @@
-"""Neural Granger prediction model with vector features and additive aggregation.
+"""Bypass-blocked causal prediction: mean + variance.
 
-Prediction for target i at time t:
-    φ_j = SharedEncoder(x_{j, t-1:t-p}) ∈ R^d  (source feature vector)
-    agg_i = Σ_j W_{ij,t} · φ_j                  (W-gated sum, ALL j including j=i)
-    x̂_{i,t} = v_i · agg_i                       (per-target linear readout)
-
-Key design choices:
-    - SUM aggregation (not MLP decoder) ensures W is identifiable:
-      the model MUST assign correct W to achieve low prediction loss.
-    - Self-dynamics (j=i) are handled by W_{ii} — no separate AR path.
-      This forces W to learn the full causal structure including self-loops.
-    - Vector features (d > 1) provide richer representations than
-      scalar-output source modules, improving nonlinear fitting.
-    - Per-target readout v_i allows each target to attend to different
-      aspects of source features without breaking W identifiability.
+Key bypass-blocking rules:
+    1. μ̂ is ONLY from A·basis — no context head, no cross-variable shortcut
+    2. σ̂² is from target variable j's OWN lag only — no cross-variable input
+    3. Cross-variable interaction ONLY through causal coefficients A_t
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-class NeuralGrangerModel(nn.Module):
-    """Neural Granger prediction: vector features + additive W-gated aggregation.
+# ──────────────────────────────────────────────────────────────────────
+#  Data alignment (leakage-free)
+# ──────────────────────────────────────────────────────────────────────
+def build_hist_and_target(Y: torch.Tensor, lag: int):
+    """Build input history and one-step-ahead targets.
 
-    Architecture:
-        - SharedEncoder: one MLP mapping R^lag → R^d (shared across all sources)
-        - Additive aggregation: agg_i = Σ_j W_{ij} · φ_j  (W is the bottleneck)
-        - Per-target readout: c_i = v_i · agg_i (linear projection, no decoder MLP)
-        - NO separate AR modules — self-dynamics go through W_{ii}
+    Alignment (no leakage):
+        X_hist[s] = [y_t, y_{t-1}, ..., y_{t-lag+1}]   (current included)
+        Y_next[s] = y_{t+1}                              (prediction target)
+
+    where t = s + lag - 1.
 
     Args:
-        num_vars: N (number of sensors)
-        lag: p (lag window size)
-        feat_dim: d (source feature dimension)
-        hidden_dim: hidden layer width for encoder
+        Y: [T, N] time series
+        lag: L
+
+    Returns:
+        X_hist: [T-lag, N, lag]
+        Y_next: [T-lag, N]
+    """
+    T, N = Y.shape
+    m = T - lag  # number of valid prediction steps
+
+    X_hist = torch.zeros(m, N, lag, device=Y.device, dtype=Y.dtype)
+    for k in range(lag):
+        # k=0 → y_t, k=1 → y_{t-1}, ..., k=lag-1 → y_{t-lag+1}
+        X_hist[:, :, k] = Y[lag - 1 - k : T - 1 - k]
+
+    Y_next = Y[lag:]  # y_{t+1} for each s
+    return X_hist, Y_next
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Mean prediction (causal path ONLY)
+# ──────────────────────────────────────────────────────────────────────
+class CausalMeanOnly(nn.Module):
+    """μ̂_j = Σ_{i,k} A^(k)_{j,i,t} · b^(k)_{i,t} + bias_j
+
+    NO context head. NO cross-variable bypass. Only A and basis.
+
+    Args:
+        num_vars: N
     """
 
-    def __init__(
-        self,
-        num_vars: int,
-        lag: int,
-        feat_dim: int = 8,
-        hidden_dim: int = 64,
-    ):
+    def __init__(self, num_vars: int):
         super().__init__()
-        self.num_vars = num_vars
-        self.lag = lag
-        self.feat_dim = feat_dim
-
-        # Shared source encoder: R^lag → R^d
-        self.source_encoder = nn.Sequential(
-            nn.Linear(lag, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, feat_dim),
-        )
-
-        # EMA-based source-wise standardization.
-        self.register_buffer('feat_running_mean', torch.zeros(num_vars, feat_dim))
-        self.register_buffer('feat_running_var', torch.ones(num_vars, feat_dim))
-        self.feat_momentum = 0.1
-
-        # Per-target readout: each target selects which feature dimensions
-        # are relevant via v_i ∈ R^d (linear projection, no bias)
-        self.readout_v = nn.Parameter(torch.randn(num_vars, feat_dim) * 0.1)
+        self.bias = nn.Parameter(torch.zeros(num_vars))
 
     def forward(
         self,
-        lag_windows: torch.Tensor,
-        W: torch.Tensor,
+        A: torch.Tensor,
+        B_feat: torch.Tensor,
     ) -> torch.Tensor:
-        """Predict x̂_i = v_i · (Σ_j W_{ij} · φ_j).
-
-        All prediction goes through W, including self-dynamics (j=i).
+        """Compute prediction mean.
 
         Args:
-            lag_windows: (batch, N, lag) — lagged inputs for each source
-            W: (N, N) or (batch, N, N) — full causal weight matrix
+            A:      [m, N_out, N_in, L] causal coefficients
+            B_feat: [m, N_in, L] basis features
 
         Returns:
-            x_hat: (batch, N) — predicted values for all targets
+            mu: [m, N_out]
         """
-        B, N, P = lag_windows.shape
+        mu = torch.einsum('mjik,mik->mj', A, B_feat) + self.bias
+        return mu
 
-        # --- Source features: shared encoder across all sources ---
-        phi_raw = self.source_encoder(
-            lag_windows.reshape(B * N, P)
-        ).reshape(B, N, self.feat_dim)
 
-        # EMA source-wise standardization
-        if self.training:
-            with torch.no_grad():
-                batch_mean = phi_raw.mean(dim=0)
-                batch_var = phi_raw.var(dim=0, unbiased=False)
-                self.feat_running_mean.mul_(1 - self.feat_momentum).add_(self.feat_momentum * batch_mean)
-                self.feat_running_var.mul_(1 - self.feat_momentum).add_(self.feat_momentum * batch_var)
+# ──────────────────────────────────────────────────────────────────────
+#  Variance prediction (own-lag ONLY — no cross-variable input)
+# ──────────────────────────────────────────────────────────────────────
+class VarHead(nn.Module):
+    """σ̂²_j = softplus(f_j(y_{j,t:t-L+1})) + ε
 
-        phi = (
-            (phi_raw - self.feat_running_mean.unsqueeze(0))
-            / (self.feat_running_var.unsqueeze(0).sqrt() + 1e-6)
+    Shared MLP + per-variable scale/shift. Input is ONLY variable j's lag.
+
+    Args:
+        num_vars: N
+        lag: L
+        hidden: MLP hidden dim
+    """
+
+    def __init__(self, num_vars: int, lag: int, hidden: int = 32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(lag, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1),
         )
+        self.scale = nn.Parameter(torch.ones(num_vars))
+        self.shift = nn.Parameter(torch.zeros(num_vars))
 
-        # --- Causal aggregation (full matrix, including diagonal) ---
-        if W.dim() == 2:
-            W_3d = W.unsqueeze(0).expand(B, -1, -1)
-        else:
-            W_3d = W
-
-        # (B, N_tgt, N_src) @ (B, N_src, d) → (B, N_tgt, d)
-        agg = torch.bmm(W_3d, phi)
-
-        # Per-target linear readout: (B, N, d) * (1, N, d) → sum over d → (B, N)
-        x_hat = (agg * self.readout_v.unsqueeze(0)).sum(dim=-1)
-
-        return x_hat
-
-    def build_lag_windows(
-        self,
-        X_seq: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build lag windows and targets from a raw time series.
+    def forward(self, X_hist: torch.Tensor) -> torch.Tensor:
+        """Predict per-variable variance.
 
         Args:
-            X_seq: (T, N) raw time series
+            X_hist: [m, N, L]
 
         Returns:
-            lag_windows: (T-lag, N, lag)
-            targets: (T-lag, N)
+            sigma2: [m, N]
         """
-        T, N = X_seq.shape
-        lag = self.lag
-
-        windows = []
-        for t in range(lag, T):
-            w = X_seq[t - lag:t].flip(0).t()  # (N, lag)
-            windows.append(w)
-
-        lag_windows = torch.stack(windows, dim=0)  # (T-lag, N, lag)
-        targets = X_seq[lag:]                       # (T-lag, N)
-        return lag_windows, targets
+        m, N, L = X_hist.shape
+        raw = self.net(X_hist.reshape(m * N, L)).view(m, N)
+        logvar = raw * self.scale + self.shift
+        sigma2 = F.softplus(logvar) + 1e-6
+        return sigma2

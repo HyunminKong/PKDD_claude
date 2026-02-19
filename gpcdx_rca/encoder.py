@@ -1,148 +1,132 @@
-"""Amortized variational encoder for temporal causal state inference.
+"""Factorized inference network for posterior q(A_t).
 
-Produces q(Z_t | Z_{t-1}, x_{≤t}) as a diagonal Gaussian,
-maintaining Markov chain structure consistent with the OU prior.
+Produces q(A_t) = N(mu_{A,t}, diag(sigma^2_{A,t})) where A_t in R^{N x N x L}.
 
 Architecture:
-    1. GRU processes observation history x_{≤t} → hidden state h_t
-    2. Combine h_t with Z_{t-1} → output (mu_t, logvar_t) for Z_t
+    1. GRU processes flattened X_hist = [y_t, ..., y_{t-L+1}] -> h_t
+    2. Information bottleneck: h_t -> z_t (small dim) to limit per-step fitting
+    3. Learned embeddings for (target j, source i, lag k)
+    4. Factorized MLP: z_t + e_j + e_i + e_k -> (mu, logvar) per edge
+
+The bottleneck prevents the InferenceNet from using A_t as a free
+per-timestep fitting parameter, forcing reliance on OU prior for
+temporal structure.
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-class CausalStateEncoder(nn.Module):
-    """Amortized variational encoder for q(Z_t | Z_{t-1}, x_{≤t}).
-
-    Uses a GRU to summarize observation history, then combines with
-    previous causal state to produce posterior parameters.
+class InferenceNet(nn.Module):
+    """Factorized posterior q(A_t) with temporal bottleneck.
 
     Args:
-        num_vars: N (number of sensors)
-        hidden_dim: GRU hidden dimension
-        num_gru_layers: number of GRU layers
+        num_vars: N
+        lag: L
+        gru_hidden: GRU hidden dimension H
+        bottleneck_dim: information bottleneck dim (limits per-step fitting)
+        emb_dim: embedding dimension E for (j, i, k)
+        mlp_hidden: shared MLP hidden dimension
     """
 
     def __init__(
         self,
         num_vars: int,
-        hidden_dim: int = 128,
-        num_gru_layers: int = 1,
+        lag: int,
+        gru_hidden: int = 128,
+        bottleneck_dim: int = 8,
+        emb_dim: int = 16,
+        mlp_hidden: int = 64,
     ):
         super().__init__()
         self.num_vars = num_vars
-        self.hidden_dim = hidden_dim
-        N = num_vars
+        self.lag = lag
+        self.mlp_hidden = mlp_hidden
 
-        # GRU: processes (x_t) sequentially → h_t
-        self.gru = nn.GRU(
-            input_size=N,
-            hidden_size=hidden_dim,
-            num_layers=num_gru_layers,
-            batch_first=True,
+        # GRU: temporal context from observation history
+        self.gru = nn.GRU(num_vars * lag, gru_hidden, batch_first=True)
+
+        # Information bottleneck: compress h_t to limit per-step capacity
+        self.h_bottleneck = nn.Sequential(
+            nn.Linear(gru_hidden, bottleneck_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
         )
 
-        # Combine GRU hidden state + flattened Z_{t-1} → posterior params
-        combine_input = hidden_dim + N * N
-        combine_hidden = hidden_dim
+        # Learned embeddings for target, source, lag
+        self.e_out = nn.Embedding(num_vars, emb_dim)  # target j
+        self.e_in = nn.Embedding(num_vars, emb_dim)   # source i
+        self.e_lag = nn.Embedding(lag, emb_dim)        # lag k
 
-        self.posterior_net = nn.Sequential(
-            nn.Linear(combine_input, combine_hidden),
-            nn.ReLU(),
-            nn.Linear(combine_hidden, combine_hidden),
-            nn.ReLU(),
-        )
+        # Factorized projection: bottleneck + edge_emb -> hidden (additive)
+        self.h_proj = nn.Linear(bottleneck_dim, mlp_hidden)
+        self.e_proj = nn.Linear(3 * emb_dim, mlp_hidden)
 
-        # Separate heads for mu and logvar
-        self.mu_head = nn.Linear(combine_hidden, N * N)
-        self.logvar_head = nn.Linear(combine_hidden, N * N)
+        # Output: hidden -> (mu, logvar)
+        self.out_proj = nn.Linear(mlp_hidden, 2)
 
-        # Initialize logvar head to produce small variance initially
-        nn.init.constant_(self.logvar_head.bias, -2.0)
-        nn.init.zeros_(self.logvar_head.weight)
+        # Initialize logvar output for small initial variance
+        nn.init.zeros_(self.out_proj.weight[1])
+        nn.init.constant_(self.out_proj.bias[1], -2.0)
 
-    def forward(
-        self,
-        x_t: torch.Tensor,
-        h_prev: torch.Tensor,
-        z_prev: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Single-step posterior update.
+    def _build_edge_embeddings(self, device: torch.device) -> torch.Tensor:
+        """Build combined edge embeddings for all (j, i, k) triples.
+
+        Returns:
+            edge_emb: [N*N*L, 3E] concatenated embeddings
+        """
+        N, L = self.num_vars, self.lag
+        j_idx = torch.arange(N, device=device)
+        i_idx = torch.arange(N, device=device)
+        k_idx = torch.arange(L, device=device)
+
+        jj, ii, kk = torch.meshgrid(j_idx, i_idx, k_idx, indexing='ij')
+        edge_emb = torch.cat([
+            self.e_out(jj.reshape(-1)),
+            self.e_in(ii.reshape(-1)),
+            self.e_lag(kk.reshape(-1)),
+        ], dim=-1)  # [N*N*L, 3E]
+        return edge_emb
+
+    def forward(self, X_hist: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Infer posterior q(A_t) for each timestep.
 
         Args:
-            x_t: (N,) current observation
-            h_prev: (num_layers, hidden_dim) GRU hidden state
-            z_prev: (N, N) previous causal state (posterior mean from t-1)
+            X_hist: [m, N, L] observation history (y_t ... y_{t-L+1})
 
         Returns:
-            q_mu: (N, N) posterior mean for Z_t
-            q_logvar: (N, N) posterior log-variance for Z_t
-            h_new: (num_layers, hidden_dim) updated GRU hidden state
+            A_mu:     [m, N, N, L] posterior mean
+            A_logvar: [m, N, N, L] posterior log-variance
         """
-        N = self.num_vars
+        m, N, L = X_hist.shape
+        device = X_hist.device
 
-        # GRU step: x_t → h_new
-        # GRU expects (batch=1, seq_len=1, N)
-        x_in = x_t.view(1, 1, N)
-        _, h_new = self.gru(x_in, h_prev)
+        # GRU over time
+        gru_in = X_hist.reshape(m, N * L).unsqueeze(0)  # [1, m, N*L]
+        h_seq, _ = self.gru(gru_in)   # [1, m, H]
+        h = h_seq.squeeze(0)          # [m, H]
 
-        # Combine GRU output with previous Z
-        h_out = h_new[-1]  # (1, hidden_dim) — last layer, batch=1
-        z_flat = z_prev.view(1, N * N)
-        combined = torch.cat([h_out, z_flat], dim=-1)  # (1, hidden+N²)
+        # Information bottleneck (limits per-step fitting capacity)
+        h_bn = self.h_bottleneck(h)  # [m, bottleneck_dim]
 
-        # Posterior parameters
-        features = self.posterior_net(combined)  # (1, combine_hidden)
-        q_mu = self.mu_head(features).view(N, N)
-        q_logvar = self.logvar_head(features).view(N, N)
+        # Edge embeddings (computed once, reused)
+        edge_emb = self._build_edge_embeddings(device)  # [n_edges, 3E]
 
-        # Clamp logvar for stability
-        q_logvar = q_logvar.clamp(-6.0, 4.0)
+        # Factorized projection (additive -- avoids large concat tensor)
+        h_feat = self.h_proj(h_bn)      # [m, mlp_hidden]
+        e_feat = self.e_proj(edge_emb)  # [n_edges, mlp_hidden]
 
-        return q_mu, q_logvar, h_new
+        # Broadcast add: [m, 1, D] + [1, n_edges, D] -> [m, n_edges, D]
+        combined = F.relu(h_feat.unsqueeze(1) + e_feat.unsqueeze(0))
 
-    def init_hidden(self, device: torch.device) -> torch.Tensor:
-        """Initialize GRU hidden state to zeros.
+        # Output
+        out = self.out_proj(combined.reshape(-1, self.mlp_hidden))
+        out = out.view(m, N, N, L, 2)
 
-        Returns:
-            h0: (num_layers, 1, hidden_dim) — batch dim=1
-        """
-        return torch.zeros(
-            self.gru.num_layers, 1, self.hidden_dim,
-            device=device,
-        )
+        A_mu = out[..., 0]
+        A_logvar = out[..., 1].clamp(-6.0, 4.0)
 
-    def encode_sequence(
-        self,
-        X_seq: torch.Tensor,
-        z_init: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Encode a full sequence to get posterior parameters at each step.
-
-        Args:
-            X_seq: (T, N) observation sequence
-            z_init: (N, N) initial Z state (e.g., from OU prior mean)
-
-        Returns:
-            q_mus: (T, N, N) posterior means
-            q_logvars: (T, N, N) posterior log-variances
-        """
-        T, N = X_seq.shape
-        device = X_seq.device
-
-        q_mus = torch.zeros(T, N, N, device=device)
-        q_logvars = torch.zeros(T, N, N, device=device)
-
-        h = self.init_hidden(device)
-        z_prev = z_init
-
-        for t in range(T):
-            q_mu, q_logvar, h = self.forward(X_seq[t], h, z_prev)
-            q_mus[t] = q_mu
-            q_logvars[t] = q_logvar
-            z_prev = q_mu  # use posterior mean as "previous state"
-
-        return q_mus, q_logvars
+        return A_mu, A_logvar
